@@ -7,7 +7,7 @@ class JM extends ComicSource {
     // unique id of the source
     key = "jm"
 
-    version = "1.4.0"
+    version = "1.4.1"
 
     minAppVersion = "1.5.0"
 
@@ -16,7 +16,7 @@ class JM extends ComicSource {
     static jmPkgName = "com.example.app"
 
     // update url
-    url = "https://cdn.jsdelivr.net/gh/venera-app/venera-configs@main/jm.js"
+    url = "https://cdn.jsdelivr.net/gh/HuaJicow/venera-configs@main/jm.js"
 
     dailyCheckInInProgress = false
 
@@ -27,7 +27,20 @@ class JM extends ComicSource {
         "www.cdnntr.cc",
     ];
 
+    static apiDomains = [
+        "www.cdntwice.org",
+        "www.cdnsha.org",
+        "www.cdnaspa.cc",
+        "www.cdnntr.cc",
+    ];
+
     static imageUrl = "https://cdn-msp.jmapinodeudzn.net"
+
+    static autoApiDomain = null
+
+    static autoImageStream = null
+
+    static autoCacheTtl = 10 * 60 * 1000
 
     static ua = "Mozilla/5.0 (Linux; Android 10; K; wv) AppleWebKit/537.36 (KHTML, like Gecko) Version/4.0 Chrome/130.0.0.0 Mobile Safari/537.36"
 
@@ -36,20 +49,198 @@ class JM extends ComicSource {
     }
 
     get baseUrl() {
-        let index = parseInt(this.loadSetting('apiDomain')) - 1
-        return `https://${JM.apiDomains[index]}`
+        return `https://${this.selectedApiDomain}`
     }
 
     get imageUrl() {
         return JM.imageUrl
     }
 
+    get domains() {
+        if (!Array.isArray(JM.apiDomains) || JM.apiDomains.length === 0) {
+            JM.apiDomains = JM.fallbackServers
+        }
+        return JM.apiDomains
+    }
+
+    get selectedApiDomain() {
+        let domains = this.domains
+        let setting = this.loadSetting('apiDomain')
+        if (setting === 'auto') {
+            let cached = JM.autoApiDomain || this.loadCachedAutoApiDomain(domains)
+            return cached || domains[0]
+        }
+        let index = parseInt(setting) - 1
+        return domains[index] || domains[0]
+    }
+
     overwriteApiDomains(domains) {
-        if (domains.length != 0) JM.apiDomains = domains
+        if (domains.length != 0) {
+            JM.apiDomains = domains
+            if (!domains.includes(JM.autoApiDomain)) JM.autoApiDomain = null
+        }
     }
 
     overwriteImgUrl(url) {
         if (url.length != 0) JM.imageUrl = url
+    }
+
+    getAutoCache(cacheKey, matchKey) {
+        let cache = this.loadData(cacheKey)
+        if (!cache || cache.matchKey !== matchKey) return null
+        if (Date.now() - cache.time > JM.autoCacheTtl) return null
+        return cache
+    }
+
+    saveAutoCache(cacheKey, matchKey, data) {
+        this.saveData(cacheKey, {
+            ...data,
+            matchKey: matchKey,
+            time: Date.now(),
+        })
+    }
+
+    loadCachedAutoApiDomain(domains) {
+        let cache = this.getAutoCache("autoApiDomain", domains.join("|"))
+        if (cache && domains.includes(cache.domain)) {
+            JM.autoApiDomain = cache.domain
+            return cache.domain
+        }
+        return null
+    }
+
+    async selectFastestApiDomain(showMessage) {
+        let domains = this.domains
+        let matchKey = domains.join("|")
+        let cache = this.getAutoCache("autoApiDomain", matchKey)
+        if (cache && domains.includes(cache.domain)) {
+            JM.autoApiDomain = cache.domain
+            return cache.domain
+        }
+
+        let results = await Promise.all(domains.map((domain) => this.testApiDomain(domain)))
+        let best = null
+        for (let result of results) {
+            if (result.ok && (!best || result.latency < best.latency)) {
+                best = result
+            }
+        }
+        if (!best) {
+            best = {
+                domain: domains[0],
+                latency: null,
+            }
+        }
+        JM.autoApiDomain = best.domain
+        this.saveAutoCache("autoApiDomain", matchKey, {
+            domain: best.domain,
+            latency: best.latency,
+        })
+        if (showMessage) {
+            let latency = best.latency === null ? "unknown" : `${best.latency}ms`
+            UI.showMessage(`Auto Api Domain:\n${best.domain}\n${latency}`)
+        }
+        return best.domain
+    }
+
+    async testApiDomain(domain) {
+        let start = Date.now()
+        try {
+            let res = await this.get(`https://${domain}/setting?app_img_shunt=1&express=`, true)
+            let setting = JSON.parse(res)
+            if (setting["img_host"]) {
+                return {
+                    domain: domain,
+                    latency: Date.now() - start,
+                    ok: true,
+                }
+            }
+        } catch (error) {}
+        return {
+            domain: domain,
+            latency: Number.MAX_SAFE_INTEGER,
+            ok: false,
+        }
+    }
+
+    async loadImageStream(index) {
+        let start = Date.now()
+        let res = await this.get(
+            `${this.baseUrl}/setting?app_img_shunt=${index}&express=`,
+            true
+        )
+        let setting = JSON.parse(res)
+        return {
+            index: index,
+            url: setting["img_host"],
+            latency: Date.now() - start,
+        }
+    }
+
+    async selectFastestImageStream(showMessage) {
+        let matchKey = `${this.selectedApiDomain}|${this.domains.join("|")}`
+        let cache = this.getAutoCache("autoImageStream", matchKey)
+        if (cache && cache.url && cache.index) {
+            JM.autoImageStream = cache
+            return cache
+        }
+
+        let indexes = ["1", "2", "3", "4"]
+        let results = await Promise.all(indexes.map((index) => this.testImageStream(index)))
+        let best = null
+        for (let result of results) {
+            if (result.ok && (!best || result.latency < best.latency)) {
+                best = result
+            }
+        }
+        if (!best) {
+            best = results.find((result) => result.url) || null
+        }
+        if (!best) return null
+
+        JM.autoImageStream = best
+        this.saveAutoCache("autoImageStream", matchKey, {
+            index: best.index,
+            url: best.url,
+            latency: best.latency,
+        })
+        if (showMessage) {
+            let latency = best.latency === null ? "unknown" : `${best.latency}ms`
+            UI.showMessage(`Auto Image Stream ${best.index}:\n${best.url}\n${latency}`)
+        }
+        return best
+    }
+
+    async testImageStream(index) {
+        try {
+            let result = await this.loadImageStream(index)
+            if (!result.url) {
+                return {
+                    ...result,
+                    ok: false,
+                }
+            }
+            let start = Date.now()
+            try {
+                let res = await Network.get(result.url, this.getImgHeaders())
+                if (res.status >= 200 && res.status < 500) {
+                    result.latency += Date.now() - start
+                    result.ok = true
+                    return result
+                }
+            } catch (error) {}
+            return {
+                ...result,
+                ok: false,
+            }
+        } catch (error) {
+            return {
+                index: index,
+                url: null,
+                latency: Number.MAX_SAFE_INTEGER,
+                ok: false,
+            }
+        }
     }
 
     isNum(str) {
@@ -71,8 +262,8 @@ class JM extends ComicSource {
         }
     }
 
-    getApiHeaders(time) {
-        if (this.loadSetting("dailyCheckInTask")) {
+    getApiHeaders(time, skipDailyCheckIn = false) {
+        if (!skipDailyCheckIn && this.loadSetting("dailyCheckInTask")) {
             this.dailyCheckIn(true)
         }
         const jmAuthKey = "18comicAPPContent"
@@ -118,7 +309,8 @@ class JM extends ComicSource {
 
     async init() {
         if (this.loadSetting('refreshDomainsOnStart')) await this.refreshApiDomains(false)
-        this.refreshImgUrl(false)
+        if (this.loadSetting('apiDomain') === 'auto') await this.selectFastestApiDomain(false)
+        await this.refreshImgUrl(false)
     }
 
     /**
@@ -167,15 +359,17 @@ class JM extends ComicSource {
                     },
                     {
                         text: "Apply",
-                        callback: () => {
+                        callback: async () => {
                             this.overwriteApiDomains(domains)
-                            this.refreshImgUrl(true)
+                            if (this.loadSetting('apiDomain') === 'auto') await this.selectFastestApiDomain(true)
+                            await this.refreshImgUrl(true)
                         }
                     }
                 ]
             )
         } else {
             this.overwriteApiDomains(domains)
+            if (this.loadSetting('apiDomain') === 'auto') await this.selectFastestApiDomain(false)
         }
     }
 
@@ -185,15 +379,17 @@ class JM extends ComicSource {
      */
     async refreshImgUrl(showMessage) {
         let index = this.loadSetting('imageStream')
-        let res = await this.get(
-            `${this.baseUrl}/setting?app_img_shunt=${index}&express=`
-        )
-        let setting = JSON.parse(res)
-        if (setting["img_host"]) {
-            if (showMessage) {
-                UI.showMessage(`Image Stream ${index}:\n${setting["img_host"]}`)
+        let result = null
+        if (index === 'auto') {
+            result = await this.selectFastestImageStream(showMessage)
+        } else {
+            result = await this.loadImageStream(index)
+        }
+        if (result && result.url) {
+            if (showMessage && index !== 'auto') {
+                UI.showMessage(`Image Stream ${result.index}:\n${result.url}`)
             }
-            this.overwriteImgUrl(setting["img_host"])
+            this.overwriteImgUrl(result.url)
         }
     }
 
@@ -252,10 +448,10 @@ class JM extends ComicSource {
      * @param url {string}
      * @returns {Promise<string>}
      */
-    async get(url) {
+    async get(url, skipDailyCheckIn = false) {
         let time = Math.floor(Date.now() / 1000)
         let kJmSecret = "185Hcomic3PAPP7R"
-        let res = await Network.get(url, this.getApiHeaders(time))
+        let res = await Network.get(url, this.getApiHeaders(time, skipDailyCheckIn))
         if(res.status !== 200) {
             if(res.status === 401) {
                 let json = JSON.parse(res.body)
@@ -1007,6 +1203,10 @@ class JM extends ComicSource {
             type: "select",
             options: [
                 {
+                    value: 'auto',
+                    text: 'Auto',
+                },
+                {
                     value: '1',
                 },
                 {
@@ -1025,6 +1225,10 @@ class JM extends ComicSource {
             title: "Image Stream",
             type: "select",
             options: [
+                {
+                    value: 'auto',
+                    text: 'Auto',
+                },
                 {
                     value: '1',
                 },
